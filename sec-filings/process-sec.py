@@ -5,14 +5,14 @@ from typing import List, Optional, Tuple, Any
 from pydantic import BaseModel, Field
 import duckdb
 
-from tensorlake.applications import Image, application, function, cls, map
+from tensorlake.applications import Image, application, function, cls
 from tensorlake.documentai import (
-    DocumentAI, PageClassConfig, StructuredExtractionOptions
+    DocumentAI, PageClassConfig, StructuredExtractionOptions, ParseResult
 )
 
 image = (
     Image(base_image="python:3.11-slim", name="snowflake-sec")
-    .run("pip install duckdb=1.3.2 pandas pyarrow")
+    .run("pip install duckdb==1.3.2 pandas pyarrow")
 )
 
 class AIRiskMention(BaseModel):
@@ -72,18 +72,9 @@ def document_ingestion(document_urls: List[str]) -> None:
             print(f"Successfully classified {file_url}: {parse_id}")
         except Exception as e:
             print(f"Failed to classify document {file_url}: {e}")
-    results = synchronize(map(extract_structured_data, parse_ids.items()))
-
-    print(type(results))
-
+    results = extract_structured_data.map(parse_ids.items())
+    print("Processing complete.")
     return results
-
-
-@function(image=image)
-def synchronize(futures: List[Any]) -> List[Any]:
-    """Synchronize parallel processing results"""
-    pass
-
 
 @function(
     image=image, 
@@ -120,13 +111,9 @@ def extract_structured_data(url_parse_id_pair: Tuple[str, str]) -> None:
             )
         ]
     )
-    
-    # Write each extracted record individually
-    for record in result:
-        write_to_motherduck(record)
-    
-    return result
 
+    # Write the structured data to MotherDuck
+    return write_to_motherduck(result, url_parse_id_pair[0])
 
 @function(
     image=image, 
@@ -140,7 +127,7 @@ def initialize_motherduck_table() -> None:
 
     con = duckdb.connect('md:ai_risk_factors')
     
-    create_table_sql = """
+    create_ai_risk_factors_sql = """
     CREATE TABLE IF NOT EXISTS ai_risk_filings (
         company_name VARCHAR,
         ticker VARCHAR,
@@ -157,46 +144,126 @@ def initialize_motherduck_table() -> None:
         regulatory_ai_risk BOOLEAN
     )
     """
-    con.execute(create_table_sql)
+    con.execute(create_ai_risk_factors_sql)
+
+    print("Creating Risk Mentions table")
+    # Create Risk Mentions table
+    create_ai_risk_mentions_sql = """
+        CREATE TABLE IF NOT EXISTS ai_risks (
+            COMPANY_NAME VARCHAR(100),
+            TICKER VARCHAR(10),
+            FISCAL_YEAR VARCHAR(4),
+            FISCAL_QUARTER VARCHAR(10),
+            SOURCE_FILE VARCHAR(500),
+            RISK_CATEGORY VARCHAR(50),
+            RISK_DESCRIPTION VARCHAR(16777216),
+            SEVERITY_INDICATOR VARCHAR(20),
+            CITATION VARCHAR(100)
+        )
+    """
+    con.execute(create_ai_risk_mentions_sql)
 
 @function(
     image=image, 
     secrets=[
+        "TENSORLAKE_API_KEY",
         "MOTHERDUCK_TOKEN"
     ]
 )
-def write_to_motherduck(data: dict) -> None:
-    """Write a single record to MotherDuck"""
-    import duckdb
-    import json
+def write_to_motherduck(parse_id: str, file_url: str) -> None:
+    """Write structured data to MotherDuck tables"""
+    print("Writing data to MotherDuck")
+    doc_ai = DocumentAI(api_key=os.getenv("TENSORLAKE_API_KEY"))
+    result: ParseResult = doc_ai.wait_for_completion(parse_id)
     
-    # Convert ai_risk_mentions to JSON string if it exists
-    if 'ai_risk_mentions' in data:
-        data['ai_risk_mentions'] = json.dumps(data.get('ai_risk_mentions', []))
+    if not result.structured_data:
+        print(f"No structured data found for {file_url}")
+        return
     
+    # Prepare data
+    raw = result.structured_data[0].data
+    record = raw if isinstance(raw, dict) else (raw[0] if isinstance(raw, list) and raw else {})
+    
+    data = dict(record)
+    mentions = data.pop("ai_risk_mentions", []) or []
+    
+    # Add source file reference
+    source_file = os.path.basename(file_url)
+    data['source_file'] = source_file
+    
+    # Serialize mentions for JSON column
+    data['ai_risk_mentions_json'] = json.dumps(mentions)
+
     con = duckdb.connect('md:ai_risk_factors')
-    
-    # Insert the single record
+
+    # Insert the single record into ai_risk_filings
     insert_sql = """
-    INSERT INTO ai_risk_filings 
-    SELECT * FROM (
-        SELECT 
-            %(company_name)s as company_name,
-            %(ticker)s as ticker,
-            %(filing_type)s as filing_type,
-            %(filing_date)s as filing_date,
-            %(fiscal_year)s as fiscal_year,
-            %(fiscal_quarter)s as fiscal_quarter,
-            %(ai_risk_mentioned)s as ai_risk_mentioned,
-            %(ai_risk_mentions)s as ai_risk_mentions,
-            %(num_ai_risk_mentions)s as num_ai_risk_mentions,
-            %(ai_strategy_mentioned)s as ai_strategy_mentioned,
-            %(ai_investment_mentioned)s as ai_investment_mentioned,
-            %(ai_competition_mentioned)s as ai_competition_mentioned,
-            %(regulatory_ai_risk)s as regulatory_ai_risk
-    )
+    INSERT INTO ai_risk_filings (
+        company_name,
+        ticker,
+        filing_type,
+        filing_date,
+        fiscal_year,
+        fiscal_quarter,
+        ai_risk_mentioned,
+        ai_risk_mentions,
+        num_ai_risk_mentions,
+        ai_strategy_mentioned,
+        ai_investment_mentioned,
+        ai_competition_mentioned,
+        regulatory_ai_risk
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
-    con.execute(insert_sql, data)
+
+    # Execute the insert with positional parameters
+    con.execute(insert_sql, (
+        data.get('company_name'),
+        data.get('ticker'),
+        data.get('filing_type'),
+        data.get('filing_date'),
+        data.get('fiscal_year'),
+        data.get('fiscal_quarter'),
+        data.get('ai_risk_mentioned'),
+        data.get('ai_risk_mentions'),
+        data.get('num_ai_risk_mentions'),
+        data.get('ai_strategy_mentioned'),
+        data.get('ai_investment_mentioned'),
+        data.get('ai_competition_mentioned'),
+        data.get('regulatory_ai_risk')
+    ))
+
+    # Insert into ai_risk_mentions table
+    if 'ai_risk_mentions' in data:
+        for mention in ai_risk_mentions:  # Load JSON string back to list
+            print("Inserting mention:", mention)
+            insert_mentions_sql = """
+            INSERT INTO ai_risks (
+                COMPANY_NAME,
+                TICKER,
+                FISCAL_YEAR,
+                FISCAL_QUARTER,
+                SOURCE_FILE,
+                RISK_CATEGORY,
+                RISK_DESCRIPTION,
+                SEVERITY_INDICATOR,
+                CITATION
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            con.execute(insert_mentions_sql, (
+                data.get('company_name'),
+                data.get('ticker'),
+                data.get('fiscal_year'),
+                data.get('fiscal_quarter'),
+                data.get('source_file', ''),  # Assuming source_file is part of data
+                data['risk_category'],
+                data['risk_description'],
+                data['severity_indicator'],
+                data['citation']
+            ))
+            print("Inserted mention:", mention)
+        print(f"Inserted {len(ai_risk_mentions)} risk mentions for {data.get('company_name')}")
+
+    con.close()  # Close the connection after operations
 
 if __name__ == "__main__":
     from tensorlake.applications import run_local_application
@@ -210,4 +277,5 @@ if __name__ == "__main__":
         document_ingestion,
         test_urls
     )
+
     print(response.output())

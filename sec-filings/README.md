@@ -124,7 +124,7 @@ To run a specific query using the deployed application:
 
 *Note: specify a command line argument 0-5*
 ```bash
-python sec-filings.py 2
+python query-sec-filings.py 2
 ```
 
 ## Files
