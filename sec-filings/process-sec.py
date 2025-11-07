@@ -11,7 +11,7 @@ from tensorlake.documentai import (
 )
 
 image = (
-    Image(base_image="python:3.11-slim", name="snowflake-sec")
+    Image(base_image="python:3.11-slim", name="motherduck-sec")
     .run("pip install duckdb==1.3.2 pandas pyarrow")
 )
 
